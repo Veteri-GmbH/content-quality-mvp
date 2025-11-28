@@ -23,10 +23,11 @@
   },
   "devDependencies": {
     "concurrently": "^8.2.2",
+    "embedded-postgres": "17.5.0-beta.15",
     "firebase-tools": "^13.0.0",
     "get-port": "^7.0.0",
     "postgres": "^3.4.7",
-    "embedded-postgres": "17.5.0-beta.15"
+    "xdg-basedir": "^5.1.0"
   },
   "keywords": [
     "react",
@@ -55,7 +56,15 @@
       "@embedded-postgres/darwin-x64",
       "@embedded-postgres/linux-arm64",
       "@embedded-postgres/linux-x64",
-      "@embedded-postgres/win32-x64"
+      "@embedded-postgres/win32-x64",
+      "@firebase/util",
+      "@tailwindcss/oxide",
+      "esbuild",
+      "es5-ext",
+      "protobufjs",
+      "re2",
+      "sharp",
+      "workerd"
     ]
   }
 }
