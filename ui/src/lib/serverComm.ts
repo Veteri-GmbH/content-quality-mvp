@@ -74,19 +74,128 @@ export async function getCurrentUser(): Promise<{
   return response.json();
 }
 
-// Example of how to add more API endpoints:
-// export async function createChat(data: CreateChatData) {
-//   const response = await fetchWithAuth('/api/v1/protected/chats', {
-//     method: 'POST',
-//     headers: {
-//       'Content-Type': 'application/json',
-//     },
-//     body: JSON.stringify(data),
-//   });
-//   return response.json();
-// }
+// Audit API endpoints
+export interface CreateAuditRequest {
+  sitemap_url: string;
+  rate_limit_ms?: number;
+}
+
+export interface Audit {
+  id: string;
+  user_id: string | null;
+  sitemap_url: string;
+  status: 'pending' | 'crawling' | 'analyzing' | 'completed' | 'failed';
+  total_urls: number;
+  processed_urls: number;
+  rate_limit_ms: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AuditPage {
+  id: string;
+  url: string;
+  status: 'pending' | 'crawling' | 'analyzing' | 'completed' | 'failed';
+  title: string | null;
+  quality_score: number | null;
+  error_message: string | null;
+  created_at: string;
+  analyzed_at: string | null;
+  issue_count: number;
+  issues?: AuditIssue[];
+}
+
+export interface AuditIssue {
+  id: string;
+  issue_type: 'grammar' | 'redundancy' | 'contradiction' | 'placeholder' | 'empty';
+  severity: 'low' | 'medium' | 'high';
+  description: string;
+  snippet: string;
+  suggestion: string | null;
+}
+
+export interface AuditProgress {
+  audit: Audit;
+  progress: {
+    total: number;
+    completed: number;
+    failed: number;
+    pending: number;
+    percentage: number;
+  };
+}
+
+export interface AuditPagesResponse {
+  pages: AuditPage[];
+  pagination: {
+    page: number;
+    limit: number;
+    total: number;
+  };
+}
+
+export async function createAudit(data: CreateAuditRequest): Promise<{ id: string; message: string }> {
+  const response = await fetchWithAuth('/api/v1/audits', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(data),
+  });
+  return response.json();
+}
+
+export async function getAudits(): Promise<{ audits: Audit[] }> {
+  const response = await fetchWithAuth('/api/v1/audits');
+  return response.json();
+}
+
+export async function getAudit(id: string): Promise<AuditProgress> {
+  const response = await fetchWithAuth(`/api/v1/audits/${id}`);
+  return response.json();
+}
+
+export async function getAuditPages(
+  id: string,
+  page: number = 1,
+  limit: number = 50,
+  filters?: { issue_type?: string; min_score?: number }
+): Promise<AuditPagesResponse> {
+  const params = new URLSearchParams({
+    page: page.toString(),
+    limit: limit.toString(),
+  });
+  
+  if (filters?.issue_type) {
+    params.append('issue_type', filters.issue_type);
+  }
+  if (filters?.min_score) {
+    params.append('min_score', filters.min_score.toString());
+  }
+
+  const response = await fetchWithAuth(`/api/v1/audits/${id}/pages?${params.toString()}`);
+  return response.json();
+}
+
+export async function exportAuditCsv(id: string): Promise<Blob> {
+  const response = await fetchWithAuth(`/api/v1/audits/${id}/export`);
+  return response.blob();
+}
+
+export async function deleteAudit(id: string): Promise<{ message: string }> {
+  const response = await fetchWithAuth(`/api/v1/audits/${id}`, {
+    method: 'DELETE',
+  });
+  return response.json();
+}
 
 export const api = {
   getCurrentUser,
-  // Add other API endpoints here
+  // Audit endpoints
+  createAudit,
+  getAudits,
+  getAudit,
+  getAuditPages,
+  exportAuditCsv,
+  deleteAudit,
 }; 

@@ -3,6 +3,7 @@ import {
   Settings, 
   FileText,
   Layers,
+  ClipboardCheck,
 } from "lucide-react";
 import { Link, useLocation } from "react-router-dom";
 import {
@@ -34,6 +35,14 @@ export function AppSidebar() {
                   <Link to="/">
                     <Home className="w-4 h-4" />
                     <span>Home</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton tooltip="Content Audits" isActive={isActive('/audits') || location.pathname.startsWith('/audits/')} asChild>
+                  <Link to="/audits">
+                    <ClipboardCheck className="w-4 h-4" />
+                    <span>Content Audits</span>
                   </Link>
                 </SidebarMenuButton>
               </SidebarMenuItem>
