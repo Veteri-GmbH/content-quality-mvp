@@ -1,5 +1,5 @@
 import { pgTable, uuid, text, integer, timestamp, jsonb, pgEnum } from 'drizzle-orm/pg-core';
-import { appSchema } from './users';
+import { appSchema, users } from './users';
 
 // Enums
 export const auditStatusEnum = pgEnum('audit_status', ['pending', 'crawling', 'analyzing', 'completed', 'failed']);
@@ -12,12 +12,13 @@ export const jobStatusEnum = pgEnum('job_status', ['pending', 'processing', 'com
 // audits table
 export const audits = appSchema.table('audits', {
   id: uuid('id').primaryKey().defaultRandom(),
-  user_id: text('user_id').references(() => appSchema.users.id, { onDelete: 'set null' }),
+  user_id: text('user_id').references(() => users.id, { onDelete: 'set null' }),
   sitemap_url: text('sitemap_url').notNull(),
   status: auditStatusEnum('status').notNull().default('pending'),
   total_urls: integer('total_urls').notNull().default(0),
   processed_urls: integer('processed_urls').notNull().default(0),
   rate_limit_ms: integer('rate_limit_ms').notNull().default(1000),
+  url_limit: integer('url_limit'), // Optional limit for URLs to crawl (null = all URLs)
   created_at: timestamp('created_at').defaultNow().notNull(),
   updated_at: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -60,6 +61,13 @@ export const jobQueue = appSchema.table('job_queue', {
   processed_at: timestamp('processed_at'),
 });
 
+// system_settings table for key-value storage (e.g., global prompts)
+export const systemSettings = appSchema.table('system_settings', {
+  key: text('key').primaryKey(),
+  value: text('value').notNull(),
+  updated_at: timestamp('updated_at').defaultNow().notNull(),
+});
+
 // Types
 export type Audit = typeof audits.$inferSelect;
 export type NewAudit = typeof audits.$inferInsert;
@@ -69,4 +77,6 @@ export type AuditIssue = typeof auditIssues.$inferSelect;
 export type NewAuditIssue = typeof auditIssues.$inferInsert;
 export type JobQueue = typeof jobQueue.$inferSelect;
 export type NewJobQueue = typeof jobQueue.$inferInsert;
+export type SystemSetting = typeof systemSettings.$inferSelect;
+export type NewSystemSetting = typeof systemSettings.$inferInsert;
 

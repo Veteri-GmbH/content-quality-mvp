@@ -4,7 +4,8 @@ import { ScoreIndicator } from './score-indicator';
 import { IssueBadge } from './issue-badge';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
 import { Button } from './ui/button';
-import { ChevronDown, ChevronRight, ExternalLink } from 'lucide-react';
+import { Badge } from './ui/badge';
+import { ChevronDown, ChevronRight, ExternalLink, CheckCircle2, XCircle, Loader2, Clock } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 interface AuditTableProps {
@@ -25,40 +26,63 @@ export function AuditTable({ pages, className }: AuditTableProps) {
     setExpandedRows(newExpanded);
   };
 
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case 'completed':
-        return 'text-green-600 dark:text-green-400';
-      case 'failed':
-        return 'text-red-600 dark:text-red-400';
-      case 'crawling':
-      case 'analyzing':
-        return 'text-yellow-600 dark:text-yellow-400';
-      default:
-        return 'text-muted-foreground';
-    }
-  };
+  // Sort pages: completed/failed first, then analyzing, then crawling, then pending
+  const sortedPages = [...pages].sort((a, b) => {
+    const statusOrder: Record<string, number> = {
+      completed: 0,
+      failed: 1,
+      analyzing: 2,
+      crawling: 3,
+      pending: 4,
+    };
+    return (statusOrder[a.status] || 999) - (statusOrder[b.status] || 999);
+  });
 
-  const getStatusLabel = (status: string) => {
+  const getStatusBadge = (status: string) => {
     switch (status) {
-      case 'pending':
-        return 'Ausstehend';
-      case 'crawling':
-        return 'Wird gecrawlt';
-      case 'analyzing':
-        return 'Wird analysiert';
       case 'completed':
-        return 'Abgeschlossen';
+        return (
+          <Badge variant="outline" className="bg-green-50 dark:bg-green-950/30 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300">
+            <CheckCircle2 className="h-3 w-3 mr-1" />
+            Abgeschlossen
+          </Badge>
+        );
       case 'failed':
-        return 'Fehler';
+        return (
+          <Badge variant="outline" className="bg-red-50 dark:bg-red-950/30 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300">
+            <XCircle className="h-3 w-3 mr-1" />
+            Fehler
+          </Badge>
+        );
+      case 'analyzing':
+        return (
+          <Badge variant="outline" className="bg-purple-50 dark:bg-purple-950/30 border-purple-200 dark:border-purple-800 text-purple-700 dark:text-purple-300">
+            <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+            Analysiert
+          </Badge>
+        );
+      case 'crawling':
+        return (
+          <Badge variant="outline" className="bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-300">
+            <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+            Crawling
+          </Badge>
+        );
+      case 'pending':
+        return (
+          <Badge variant="outline" className="bg-gray-50 dark:bg-gray-950/30 border-gray-200 dark:border-gray-800 text-gray-700 dark:text-gray-300">
+            <Clock className="h-3 w-3 mr-1" />
+            Ausstehend
+          </Badge>
+        );
       default:
-        return status;
+        return <Badge variant="outline">{status}</Badge>;
     }
   };
 
   return (
     <div className={cn('space-y-4', className)}>
-      {pages.map((page) => {
+      {sortedPages.map((page) => {
         const isExpanded = expandedRows.has(page.id);
         const hasIssues = page.issues && page.issues.length > 0;
 
@@ -97,21 +121,22 @@ export function AuditTable({ pages, className }: AuditTableProps) {
                   </div>
                 </div>
                 <div className="flex items-center gap-4">
-                  <div className="text-right">
-                    <div className="text-xs text-muted-foreground">Status</div>
-                    <div className={cn('text-sm font-medium', getStatusColor(page.status))}>
-                      {getStatusLabel(page.status)}
-                    </div>
-                  </div>
-                  <div className="text-right">
-                    <div className="text-xs text-muted-foreground">Score</div>
-                    <ScoreIndicator score={page.quality_score} />
-                  </div>
-                  <div className="text-right">
-                    <div className="text-xs text-muted-foreground">Issues</div>
-                    <div className="text-sm font-medium">
-                      {page.issue_count || 0}
-                    </div>
+                  <div className="flex flex-col items-end gap-2">
+                    {getStatusBadge(page.status)}
+                    {page.status === 'completed' && (
+                      <div className="flex items-center gap-3">
+                        <div className="text-right">
+                          <div className="text-xs text-muted-foreground">Score</div>
+                          <ScoreIndicator score={page.quality_score} />
+                        </div>
+                        <div className="text-right">
+                          <div className="text-xs text-muted-foreground">Issues</div>
+                          <div className="text-sm font-medium">
+                            {page.issue_count || 0}
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>

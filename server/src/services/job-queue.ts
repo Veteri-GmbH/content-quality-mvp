@@ -1,7 +1,9 @@
 import { getDatabase } from '../lib/db';
 import { jobQueue, type NewJobQueue, type JobQueue as JobQueueType } from '../schema/audits';
-import { eq, and, lte, or, isNull } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
+import { sql as rawSql } from 'drizzle-orm';
 
+export type { JobQueueType as JobQueue };
 export type JobType = 'crawl_page' | 'analyze_page';
 export type JobStatus = 'pending' | 'processing' | 'completed' | 'failed';
 
@@ -26,57 +28,99 @@ export async function enqueueJob(
     max_attempts: 3,
   };
 
-  const result = await db.insert(jobQueue).values(newJob).returning({ id: jobQueue.id });
+  const result = await db.insert(jobQueue).values(newJob).returning();
   return result[0].id;
 }
 
 /**
  * Get the next pending job from the queue
- * Uses pessimistic locking with locked_until timestamp
+ * Uses atomic UPDATE with subquery to prevent race conditions
  */
 export async function getNextJob(): Promise<JobQueueType | null> {
-  const db = await getDatabase();
-  const now = new Date();
-  const lockDuration = 5 * 60 * 1000; // 5 minutes lock
+  try {
+    const db = await getDatabase();
+    const now = new Date();
+    const lockDuration = 5 * 60 * 1000; // 5 minutes lock
+    const lockedUntil = new Date(now.getTime() + lockDuration);
 
-  // Find a job that is pending and not locked (or lock expired)
-  const jobs = await db
-    .select()
-    .from(jobQueue)
-    .where(
-      and(
-        eq(jobQueue.status, 'pending'),
-        or(
-          isNull(jobQueue.locked_until),
-          lte(jobQueue.locked_until, now)
-        )
+    // Convert dates to ISO strings for postgres raw query
+    const nowIso = now.toISOString();
+    const lockedUntilIso = lockedUntil.toISOString();
+
+    // Use atomic UPDATE with RETURNING to claim a job
+    // This prevents race conditions where multiple workers grab the same job
+    const result = await db.execute(rawSql`
+      UPDATE app.job_queue
+      SET 
+        status = 'processing',
+        locked_until = ${lockedUntilIso}::timestamp,
+        attempts = attempts + 1
+      WHERE id = (
+        SELECT id FROM app.job_queue
+        WHERE status = 'pending'
+        AND (locked_until IS NULL OR locked_until <= ${nowIso}::timestamp)
+        ORDER BY created_at ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
       )
-    )
-    .limit(1);
+      RETURNING *
+    `);
 
-  if (jobs.length === 0) {
+    // Handle different return types from drizzle (neon vs postgres)
+    const rows = Array.isArray(result) ? result : (result as any).rows || [];
+    if (rows.length === 0) {
+      return null;
+    }
+
+    const row = rows[0] as any;
+    
+    // Parse payload if it's a string (can happen with raw SQL queries)
+    let parsedPayload = row.payload;
+    if (typeof parsedPayload === 'string') {
+      try {
+        parsedPayload = JSON.parse(parsedPayload);
+      } catch (e) {
+        console.error('[DEBUG] Failed to parse payload JSON:', {
+          payload: parsedPayload,
+          error: e instanceof Error ? e.message : 'Unknown error',
+        });
+        throw new Error('Invalid payload format');
+      }
+    }
+    
+    console.log('[DEBUG] getNextJob returning:', {
+      jobId: row.id,
+      jobType: row.job_type,
+      payloadType: typeof row.payload,
+      payloadIsString: typeof row.payload === 'string',
+      parsedPayloadType: typeof parsedPayload,
+      parsedPayloadKeys: typeof parsedPayload === 'object' && parsedPayload !== null ? Object.keys(parsedPayload) : 'N/A',
+    });
+    
+    return {
+      id: row.id,
+      job_type: row.job_type,
+      payload: parsedPayload,
+      status: row.status,
+      attempts: row.attempts,
+      max_attempts: row.max_attempts,
+      locked_until: row.locked_until ? new Date(row.locked_until) : null,
+      created_at: new Date(row.created_at),
+      processed_at: row.processed_at ? new Date(row.processed_at) : null,
+    };
+  } catch (error: any) {
+    // Don't spam logs for connection errors - database might still be starting
+    if (error?.code === 'ECONNREFUSED' || error?.code === '57P03') {
+      // Database not ready yet - silent return, will retry
+      return null;
+    }
+    console.error('[DEBUG] getNextJob error:', {
+      code: error?.code,
+      message: error?.message,
+      errno: error?.errno,
+    });
     return null;
   }
-
-  const job = jobs[0];
-
-  // Lock the job
-  const lockedUntil = new Date(now.getTime() + lockDuration);
-  await db
-    .update(jobQueue)
-    .set({
-      status: 'processing',
-      locked_until: lockedUntil,
-      attempts: job.attempts + 1,
-    })
-    .where(eq(jobQueue.id, job.id));
-
-  return {
-    ...job,
-    status: 'processing',
-    locked_until: lockedUntil,
-    attempts: job.attempts + 1,
-  };
 }
 
 /**
@@ -109,6 +153,21 @@ export async function failJob(jobId: string, error?: string): Promise<void> {
   const currentJob = job[0];
   const hasReachedMaxAttempts = currentJob.attempts >= currentJob.max_attempts;
 
+  // Parse payload if it's a string
+  let parsedPayload = currentJob.payload;
+  if (typeof parsedPayload === 'string') {
+    try {
+      parsedPayload = JSON.parse(parsedPayload);
+    } catch (e) {
+      console.error('[DEBUG] Failed to parse payload in failJob:', {
+        payload: parsedPayload,
+        error: e instanceof Error ? e.message : 'Unknown error',
+      });
+      // If parsing fails, keep original payload
+      parsedPayload = currentJob.payload;
+    }
+  }
+
   await db
     .update(jobQueue)
     .set({
@@ -117,8 +176,8 @@ export async function failJob(jobId: string, error?: string): Promise<void> {
       locked_until: null,
       // Store error in payload if needed
       payload: error
-        ? { ...(currentJob.payload as object), error }
-        : currentJob.payload,
+        ? { ...(parsedPayload as object), error }
+        : parsedPayload,
     })
     .where(eq(jobQueue.id, jobId));
 }
@@ -126,44 +185,106 @@ export async function failJob(jobId: string, error?: string): Promise<void> {
 /**
  * Process jobs continuously (worker loop)
  * Should be called when the server starts
+ * Starts multiple workers for parallel processing
  */
 export async function startJobProcessor(
-  processJob: (job: JobQueueType) => Promise<void>
+  processJob: (job: JobQueueType) => Promise<void>,
+  workerCount: number = 3
 ): Promise<void> {
-  console.log('🚀 Starting job processor...');
+  console.log(`🚀 Starting job processor with ${workerCount} workers...`);
 
-  const processNext = async () => {
-    try {
-      const job = await getNextJob();
-      if (!job) {
-        // No jobs available, wait before checking again
-        setTimeout(processNext, 2000); // Check every 2 seconds
-        return;
-      }
+  // Track active crawl jobs per audit (for rate limiting)
+  const activeCrawlsByAudit = new Map<string, boolean>();
 
-      console.log(`📦 Processing job ${job.id} (${job.job_type})`);
+  const startWorker = (workerId: number) => {
+    let consecutiveErrors = 0;
+    const processNext = async () => {
       try {
-        await processJob(job);
-        await completeJob(job.id);
-        console.log(`✅ Completed job ${job.id}`);
-      } catch (error) {
-        console.error(`❌ Job ${job.id} failed:`, error);
-        await failJob(
-          job.id,
-          error instanceof Error ? error.message : 'Unknown error'
-        );
-      }
+        const job = await getNextJob();
+        if (!job) {
+          // Reset error counter on successful query (even if no job found)
+          consecutiveErrors = 0;
+          // No jobs available, wait before checking again
+          setTimeout(processNext, 2000); // Check every 2 seconds
+          return;
+        }
 
-      // Process next job immediately
-      processNext();
-    } catch (error) {
-      console.error('❌ Job processor error:', error);
-      // Continue processing after delay
-      setTimeout(processNext, 5000); // Wait 5 seconds on error
-    }
+        // Reset error counter on successful job retrieval
+        consecutiveErrors = 0;
+        console.log('[DEBUG] Worker processing job:', {
+          workerId,
+          jobId: job.id,
+          jobType: job.job_type,
+          payload: job.payload,
+        });
+        
+        // Rate limiting: Only one crawl per audit at a time
+        if (job.job_type === 'crawl_page') {
+          const payload = job.payload as { audit_id: string };
+          const auditId = payload.audit_id;
+          
+          // Wait if there's already a crawl job running for this audit
+          while (activeCrawlsByAudit.get(auditId)) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+          
+          // Mark this audit as having an active crawl
+          activeCrawlsByAudit.set(auditId, true);
+          
+          try {
+            await processJob(job);
+            await completeJob(job.id);
+            console.log(`✅ [Worker ${workerId}] Completed job ${job.id}`);
+          } catch (error) {
+            console.error(`❌ [Worker ${workerId}] Job ${job.id} failed:`, error);
+            await failJob(
+              job.id,
+              error instanceof Error ? error.message : 'Unknown error'
+            );
+          } finally {
+            // Release the crawl lock for this audit
+            activeCrawlsByAudit.delete(auditId);
+          }
+        } else {
+          // Analyze jobs can run in parallel without restrictions
+          try {
+            await processJob(job);
+            await completeJob(job.id);
+            console.log(`✅ [Worker ${workerId}] Completed job ${job.id}`);
+          } catch (error) {
+            console.error(`❌ [Worker ${workerId}] Job ${job.id} failed:`, error);
+            await failJob(
+              job.id,
+              error instanceof Error ? error.message : 'Unknown error'
+            );
+          }
+        }
+
+        // Process next job immediately
+        processNext();
+      } catch (error: any) {
+        consecutiveErrors++;
+        // Only log after multiple consecutive errors to avoid spam
+        if (consecutiveErrors >= 3) {
+          console.error(`[DEBUG] [Worker ${workerId}] Consecutive errors (${consecutiveErrors}):`, {
+            code: error?.code,
+            message: error?.message,
+            errno: error?.errno,
+          });
+        }
+        // Wait longer on errors (especially connection errors)
+        const delay = error?.code === 'ECONNREFUSED' || error?.code === '57P03' ? 10000 : 5000;
+        setTimeout(processNext, delay);
+      }
+    };
+
+    // Start this worker
+    processNext();
   };
 
-  // Start processing
-  processNext();
+  // Start multiple workers
+  for (let i = 1; i <= workerCount; i++) {
+    startWorker(i);
+  }
 }
 

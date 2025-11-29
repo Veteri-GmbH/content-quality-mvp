@@ -6,7 +6,7 @@ import { authMiddleware } from './middleware/auth';
 import { getDatabase, testDatabaseConnection } from './lib/db';
 import { setEnvContext, clearEnvContext, getDatabaseUrl } from './lib/env';
 import * as schema from './schema/users';
-import { audits, auditPages, auditIssues } from './schema/audits';
+import { audits, auditPages, auditIssues, systemSettings } from './schema/audits';
 import { eq, and, desc, sql } from 'drizzle-orm';
 import { startAudit, getAuditProgress, generateCsvExport, processCrawlPageJob, processAnalyzePageJob } from './services/audit-service';
 import { startJobProcessor } from './services/job-queue';
@@ -147,7 +147,7 @@ const getUserId = (c: any): string | undefined => {
 auditRoutes.post('/', async (c) => {
   try {
     const body = await c.req.json();
-    const { sitemap_url, rate_limit_ms } = body;
+    const { sitemap_url, rate_limit_ms, url_limit } = body;
 
     if (!sitemap_url || typeof sitemap_url !== 'string') {
       return c.json({ error: 'sitemap_url is required' }, 400);
@@ -160,10 +160,18 @@ auditRoutes.post('/', async (c) => {
       return c.json({ error: 'Invalid sitemap URL format' }, 400);
     }
 
+    // Validate url_limit if provided
+    if (url_limit !== undefined && url_limit !== null) {
+      if (typeof url_limit !== 'number' || url_limit <= 0) {
+        return c.json({ error: 'url_limit must be a positive number' }, 400);
+      }
+    }
+
     const userId = getUserId(c);
     const rateLimit = rate_limit_ms && typeof rate_limit_ms === 'number' ? rate_limit_ms : 1000;
+    const urlLimit = url_limit && typeof url_limit === 'number' ? url_limit : undefined;
 
-    const auditId = await startAudit(sitemap_url, userId, rateLimit);
+    const auditId = await startAudit(sitemap_url, userId, rateLimit, urlLimit);
 
     return c.json({ id: auditId, message: 'Audit started' }, 201);
   } catch (error) {
@@ -258,7 +266,7 @@ auditRoutes.get('/:id/pages', async (c) => {
     // Filter by issue type and min score if needed
     let filteredPages = pages;
     if (issueType || minScore) {
-      filteredPages = await Promise.all(
+      const pagesWithFiltering = await Promise.all(
         pages.map(async (page) => {
           const issues = await db
             .select()
@@ -279,7 +287,7 @@ auditRoutes.get('/:id/pages', async (c) => {
           };
         })
       );
-      filteredPages = filteredPages.filter((p) => p !== null) as any[];
+      filteredPages = pagesWithFiltering.filter((p): p is NonNullable<typeof p> => p !== null);
     } else {
       // Load issues for all pages
       filteredPages = await Promise.all(
@@ -358,22 +366,145 @@ auditRoutes.delete('/:id', async (c) => {
 // Mount audit routes
 api.route('/audits', auditRoutes);
 
+// Settings routes
+const settingsRoutes = new Hono();
+
+// Default analysis prompt (fallback)
+const DEFAULT_ANALYSIS_PROMPT = `Analysiere den folgenden Website-Content auf Textqualitätsprobleme.
+
+Titel: {title}
+Content:
+{content}
+
+Prüfe auf:
+1. Grammatik/Rechtschreibung - Fehler in Sprache
+2. Redundanz - Wiederholte Phrasen oder Absätze
+3. Widersprüche - Inkonsistente Informationen (z.B. verschiedene Material-Angaben)
+4. Platzhalter - Lorem Ipsum, TODO, "[hier einfügen]", etc.
+5. Leere Inhalte - Fehlende Beschreibungen
+
+Antworte NUR mit einem gültigen JSON-Array im folgenden Format (kein zusätzlicher Text):
+[{ "type": "grammar|redundancy|contradiction|placeholder|empty", 
+   "severity": "low|medium|high",
+   "description": "...",
+   "snippet": "betroffener Text",
+   "suggestion": "Verbesserungsvorschlag" }]
+
+Berechne zusätzlich einen Quality Score (0-100) basierend auf der Anzahl und Schwere der gefundenen Probleme.`;
+
+// GET /settings/prompt - Get current analysis prompt
+settingsRoutes.get('/prompt', async (c) => {
+  try {
+    const db = await getDatabase();
+    const result = await db
+      .select()
+      .from(systemSettings)
+      .where(eq(systemSettings.key, 'analysis_prompt'))
+      .limit(1);
+
+    const prompt = result.length > 0 ? result[0].value : DEFAULT_ANALYSIS_PROMPT;
+    return c.json({ prompt, isDefault: result.length === 0 });
+  } catch (error) {
+    console.error('Error fetching prompt:', error);
+    return c.json({ error: 'Failed to fetch prompt' }, 500);
+  }
+});
+
+// PUT /settings/prompt - Update analysis prompt
+settingsRoutes.put('/prompt', async (c) => {
+  try {
+    const body = await c.req.json();
+    const { prompt } = body;
+
+    if (!prompt || typeof prompt !== 'string') {
+      return c.json({ error: 'prompt is required' }, 400);
+    }
+
+    if (prompt.trim().length < 50) {
+      return c.json({ error: 'Prompt muss mindestens 50 Zeichen lang sein' }, 400);
+    }
+
+    const db = await getDatabase();
+    
+    // Upsert the prompt
+    await db
+      .insert(systemSettings)
+      .values({
+        key: 'analysis_prompt',
+        value: prompt.trim(),
+        updated_at: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: systemSettings.key,
+        set: {
+          value: prompt.trim(),
+          updated_at: new Date(),
+        },
+      });
+
+    return c.json({ message: 'Prompt updated successfully' });
+  } catch (error) {
+    console.error('Error updating prompt:', error);
+    return c.json({ error: 'Failed to update prompt' }, 500);
+  }
+});
+
+// GET /settings/prompt/default - Get default prompt
+settingsRoutes.get('/prompt/default', (c) => {
+  return c.json({ prompt: DEFAULT_ANALYSIS_PROMPT });
+});
+
+// Mount settings routes
+api.route('/settings', settingsRoutes);
+
 // Mount the protected routes under /protected
 api.route('/protected', protectedRoutes);
 
 // Mount the API router
 app.route('/api/v1', api);
 
-// Start job processor when server starts (only in Node.js environment)
+// Check and run database migrations on startup (only in Node.js environment)
 if (typeof process !== 'undefined') {
-  startJobProcessor(async (job) => {
-    if (job.job_type === 'crawl_page') {
-      await processCrawlPageJob(job);
-    } else if (job.job_type === 'analyze_page') {
-      await processAnalyzePageJob(job);
+  // Import and run migration check, then start job processor
+  import('./migrations/auto-migrate').then(async (module) => {
+    try {
+      await module.checkAndMigrate();
+      console.log('[DEBUG] Migration check completed, starting job processor...');
+      
+      // Start job processor after migration check completes
+      startJobProcessor(async (job) => {
+        if (job.job_type === 'crawl_page') {
+          await processCrawlPageJob(job);
+        } else if (job.job_type === 'analyze_page') {
+          await processAnalyzePageJob(job);
+        }
+      }).catch((error) => {
+        console.error('[DEBUG] Failed to start job processor:', {
+          code: error?.code,
+          message: error?.message,
+        });
+      });
+    } catch (error) {
+      console.error('Migration check failed:', error);
+      // Still try to start job processor after delay
+      setTimeout(() => {
+        console.log('[DEBUG] Starting job processor after migration failure...');
+        startJobProcessor(async (job) => {
+          if (job.job_type === 'crawl_page') {
+            await processCrawlPageJob(job);
+          } else if (job.job_type === 'analyze_page') {
+            await processAnalyzePageJob(job);
+          }
+        }).catch((error) => {
+          console.error('[DEBUG] Failed to start job processor:', {
+            code: error?.code,
+            message: error?.message,
+          });
+        });
+      }, 10000); // Wait 10 seconds if migration failed
     }
   }).catch((error) => {
-    console.error('Failed to start job processor:', error);
+    console.log('⚠️  Auto-migration not available:', error.message);
   });
 }
 
