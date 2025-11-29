@@ -20,17 +20,26 @@ import { enqueueJob, getNextJob, completeJob, failJob, type JobQueue } from './j
 export async function startAudit(
   sitemapUrl: string,
   userId?: string,
-  rateLimitMs: number = 1000
+  rateLimitMs: number = 1000,
+  urlLimit?: number
 ): Promise<string> {
   const db = await getDatabase();
 
   // Parse sitemap to get all URLs
   console.log(`📋 Parsing sitemap: ${sitemapUrl}`);
-  const urls = await parseSitemap(sitemapUrl);
-  console.log(`✅ Found ${urls.length} URLs in sitemap`);
-
+  let urls = await parseSitemap(sitemapUrl);
+  const originalCount = urls.length;
+  
   if (urls.length === 0) {
     throw new Error('No URLs found in sitemap');
+  }
+
+  // Apply URL limit if specified
+  if (urlLimit && urlLimit > 0 && urlLimit < urls.length) {
+    urls = urls.slice(0, urlLimit);
+    console.log(`✅ Found ${originalCount} URLs in sitemap, limiting to ${urls.length} URLs`);
+  } else {
+    console.log(`✅ Found ${urls.length} URLs in sitemap`);
   }
 
   // Create audit record
@@ -41,9 +50,10 @@ export async function startAudit(
     total_urls: urls.length,
     processed_urls: 0,
     rate_limit_ms: rateLimitMs,
+    url_limit: urlLimit,
   };
 
-  const auditResult = await db.insert(audits).values(newAudit).returning({ id: audits.id });
+  const auditResult = await db.insert(audits).values(newAudit).returning();
   const auditId = auditResult[0].id;
 
   // Create page records for all URLs
@@ -101,18 +111,49 @@ export async function getAuditProgress(auditId: string) {
     .groupBy(auditPages.status);
 
   const totalPages = audit[0].total_urls;
-  const completedPages =
-    pages.find((p) => p.status === 'completed')?.count || 0;
-  const failedPages = pages.find((p) => p.status === 'failed')?.count || 0;
+  const completedPages = Number(pages.find((p) => p.status === 'completed')?.count || 0);
+  const failedPages = Number(pages.find((p) => p.status === 'failed')?.count || 0);
+  const crawlingPages = Number(pages.find((p) => p.status === 'crawling')?.count || 0);
+  const analyzingPages = Number(pages.find((p) => p.status === 'analyzing')?.count || 0);
+  const pendingPages = Number(pages.find((p) => p.status === 'pending')?.count || 0);
+  
+  // Calculate how many pages have been crawled (all non-pending pages)
+  // pending = waiting for crawl, everything else = crawled or in progress
+  const crawledPages = totalPages - pendingPages;
+  
+  // Calculate overall progress percentage (weighted: crawling = 50%, analyzing = 100%)
+  const crawlProgress = crawledPages / totalPages;
+  const analyzeProgress = completedPages / totalPages;
+  const overallPercentage = totalPages > 0 
+    ? Math.round(((crawlProgress * 0.5) + (analyzeProgress * 0.5)) * 100) 
+    : 0;
+
+  console.log('[DEBUG] getAuditProgress:', {
+    auditId,
+    totalPages,
+    statusCounts: pages.map(p => ({ status: p.status, count: Number(p.count) })),
+    calculated: {
+      completed: completedPages,
+      failed: failedPages,
+      crawling: crawlingPages,
+      analyzing: analyzingPages,
+      pending: pendingPages,
+      crawled: crawledPages,
+      percentage: overallPercentage,
+    },
+  });
 
   return {
     audit: audit[0],
     progress: {
       total: totalPages,
-      completed: Number(completedPages),
-      failed: Number(failedPages),
-      pending: totalPages - Number(completedPages) - Number(failedPages),
-      percentage: totalPages > 0 ? Math.round((Number(completedPages) / totalPages) * 100) : 0,
+      completed: completedPages,
+      failed: failedPages,
+      crawling: crawlingPages,
+      analyzing: analyzingPages,
+      pending: pendingPages,
+      crawled: crawledPages,
+      percentage: overallPercentage,
     },
   };
 }
@@ -144,7 +185,7 @@ export async function generateCsvExport(auditId: string): Promise<string> {
         .limit(1);
 
       if (pageRecord.length === 0) {
-        return { ...page, issues_summary: '', snippets: '' };
+        return { ...page, issues_summary: '', snippets: '', suggestions: '' };
       }
 
       const issues = await db
@@ -164,22 +205,40 @@ export async function generateCsvExport(auditId: string): Promise<string> {
         .map(([type, count]) => `${type}: ${count}`)
         .join(', ');
 
+      // Collect suggestions
+      const suggestions: string[] = [];
+      for (const issue of issues) {
+        if (issue.suggestion) {
+          suggestions.push(issue.suggestion);
+        }
+      }
+
       return {
         ...page,
         issues_summary: issuesSummary,
         snippets: snippets.join(' | '),
+        suggestions: suggestions.join(' | '),
       };
     })
   );
 
+  // Helper function to escape CSV values
+  const escapeCSV = (value: string): string => {
+    if (value.includes(',') || value.includes('"') || value.includes('\n')) {
+      return `"${value.replace(/"/g, '""')}"`;
+    }
+    return value;
+  };
+
   // Generate CSV
-  const headers = ['url', 'quality_score', 'issue_count', 'issues_summary', 'flagged_snippets'];
+  const headers = ['url', 'quality_score', 'issue_count', 'issues_summary', 'flagged_snippets', 'suggestions'];
   const rows = pagesWithIssues.map((page) => [
-    page.url,
+    escapeCSV(page.url),
     page.quality_score?.toString() || '',
     page.issues?.toString() || '0',
-    `"${page.issues_summary}"`,
-    `"${page.snippets}"`,
+    escapeCSV(page.issues_summary),
+    escapeCSV(page.snippets),
+    escapeCSV(page.suggestions),
   ]);
 
   const csv = [headers.join(','), ...rows.map((row) => row.join(','))].join('\n');
@@ -191,7 +250,38 @@ export async function generateCsvExport(auditId: string): Promise<string> {
  */
 export async function processCrawlPageJob(job: JobQueue): Promise<void> {
   const db = await getDatabase();
-  const payload = job.payload as { audit_id: string; page_id: string; url: string; rate_limit_ms: number };
+  
+  console.log('[DEBUG] processCrawlPageJob received job:', {
+    jobId: job.id,
+    jobType: job.job_type,
+    payloadType: typeof job.payload,
+    payloadValue: job.payload,
+    payloadIsString: typeof job.payload === 'string',
+  });
+  
+  // Parse payload if it's a string
+  let parsedPayload = job.payload;
+  if (typeof parsedPayload === 'string') {
+    try {
+      parsedPayload = JSON.parse(parsedPayload);
+    } catch (e) {
+      console.error('[DEBUG] Failed to parse payload in processCrawlPageJob:', {
+        payload: parsedPayload,
+        error: e instanceof Error ? e.message : 'Unknown error',
+      });
+      throw new Error('Invalid payload format');
+    }
+  }
+  
+  const payload = parsedPayload as { audit_id: string; page_id: string; url: string; rate_limit_ms: number };
+
+  console.log('[DEBUG] processCrawlPageJob started:', {
+    jobId: job.id,
+    pageId: payload.page_id,
+    url: payload.url,
+    auditId: payload.audit_id,
+    rateLimitMs: payload.rate_limit_ms,
+  });
 
   try {
     // Update page status to crawling
@@ -199,15 +289,26 @@ export async function processCrawlPageJob(job: JobQueue): Promise<void> {
       .update(auditPages)
       .set({ status: 'crawling' })
       .where(eq(auditPages.id, payload.page_id));
+    
+    console.log('[DEBUG] Updated page to crawling:', {
+      pageId: payload.page_id,
+    });
 
-    // Wait for rate limiting
-    if (payload.rate_limit_ms > 0) {
-      await new Promise((resolve) => setTimeout(resolve, payload.rate_limit_ms));
+    // Wait for rate limiting (ensure non-negative delay)
+    const delay = Math.max(0, payload.rate_limit_ms || 0);
+    if (delay > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
 
     // Crawl the URL
     console.log(`🕷️ Crawling: ${payload.url}`);
     const { title, content } = await crawlUrl(payload.url);
+
+    console.log('[DEBUG] Crawl successful:', {
+      url: payload.url,
+      titleLength: title?.length || 0,
+      contentLength: content?.length || 0,
+    });
 
     // Update page with crawled content
     await db
@@ -215,20 +316,34 @@ export async function processCrawlPageJob(job: JobQueue): Promise<void> {
       .set({
         title,
         content,
-        status: 'pending', // Ready for analysis
+        status: 'analyzing', // Crawled, ready for analysis
       })
       .where(eq(auditPages.id, payload.page_id));
 
+    console.log('[DEBUG] Updated page to analyzing:', {
+      pageId: payload.page_id,
+    });
+
     // Enqueue analysis job
-    await enqueueJob('analyze_page', {
+    const analyzeJobId = await enqueueJob('analyze_page', {
       audit_id: payload.audit_id,
       page_id: payload.page_id,
+    });
+
+    console.log('[DEBUG] Enqueued analyze job:', {
+      analyzeJobId,
+      pageId: payload.page_id,
     });
 
     console.log(`✅ Crawled: ${payload.url}`);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error(`❌ Crawl failed for ${payload.url}: ${errorMessage}`);
+    console.error('[DEBUG] Crawl failed:', {
+      url: payload.url,
+      pageId: payload.page_id,
+      error: errorMessage,
+      errorStack: error instanceof Error ? error.stack : undefined,
+    });
 
     await db
       .update(auditPages)
@@ -247,7 +362,22 @@ export async function processCrawlPageJob(job: JobQueue): Promise<void> {
  */
 export async function processAnalyzePageJob(job: JobQueue): Promise<void> {
   const db = await getDatabase();
-  const payload = job.payload as { audit_id: string; page_id: string };
+  
+  // Parse payload if it's a string
+  let parsedPayload = job.payload;
+  if (typeof parsedPayload === 'string') {
+    try {
+      parsedPayload = JSON.parse(parsedPayload);
+    } catch (e) {
+      console.error('[DEBUG] Failed to parse payload in processAnalyzePageJob:', {
+        payload: parsedPayload,
+        error: e instanceof Error ? e.message : 'Unknown error',
+      });
+      throw new Error('Invalid payload format');
+    }
+  }
+  
+  const payload = parsedPayload as { audit_id: string; page_id: string };
 
   try {
     // Get page data

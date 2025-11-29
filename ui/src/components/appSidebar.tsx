@@ -47,10 +47,10 @@ export function AppSidebar() {
                 </SidebarMenuButton>
               </SidebarMenuItem>
               <SidebarMenuItem>
-                <SidebarMenuButton tooltip="Page 1" isActive={isActive('/page1')} asChild>
-                  <Link to="/page1">
+                <SidebarMenuButton tooltip="Prompt-Einstellungen" isActive={isActive('/prompt-settings')} asChild>
+                  <Link to="/prompt-settings">
                     <FileText className="w-4 h-4" />
-                    <span>Page 1</span>
+                    <span>Prompt-Einstellungen</span>
                   </Link>
                 </SidebarMenuButton>
               </SidebarMenuItem>

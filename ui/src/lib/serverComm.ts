@@ -78,6 +78,7 @@ export async function getCurrentUser(): Promise<{
 export interface CreateAuditRequest {
   sitemap_url: string;
   rate_limit_ms?: number;
+  url_limit?: number;
 }
 
 export interface Audit {
@@ -88,6 +89,7 @@ export interface Audit {
   total_urls: number;
   processed_urls: number;
   rate_limit_ms: number;
+  url_limit: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -120,7 +122,10 @@ export interface AuditProgress {
     total: number;
     completed: number;
     failed: number;
+    crawling: number;
+    analyzing: number;
     pending: number;
+    crawled: number;
     percentage: number;
   };
 }
@@ -189,6 +194,33 @@ export async function deleteAudit(id: string): Promise<{ message: string }> {
   return response.json();
 }
 
+// Settings API endpoints
+export interface PromptResponse {
+  prompt: string;
+  isDefault?: boolean;
+}
+
+export async function getPrompt(): Promise<PromptResponse> {
+  const response = await fetchWithAuth('/api/v1/settings/prompt');
+  return response.json();
+}
+
+export async function updatePrompt(prompt: string): Promise<{ message: string }> {
+  const response = await fetchWithAuth('/api/v1/settings/prompt', {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ prompt }),
+  });
+  return response.json();
+}
+
+export async function getDefaultPrompt(): Promise<PromptResponse> {
+  const response = await fetchWithAuth('/api/v1/settings/prompt/default');
+  return response.json();
+}
+
 export const api = {
   getCurrentUser,
   // Audit endpoints
@@ -198,4 +230,8 @@ export const api = {
   getAuditPages,
   exportAuditCsv,
   deleteAudit,
+  // Settings endpoints
+  getPrompt,
+  updatePrompt,
+  getDefaultPrompt,
 }; 

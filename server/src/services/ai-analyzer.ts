@@ -1,4 +1,7 @@
 import { getEnv } from '../lib/env';
+import { getDatabase } from '../lib/db';
+import { systemSettings } from '../schema/audits';
+import { eq } from 'drizzle-orm';
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 
@@ -18,7 +21,8 @@ export interface AnalysisResult {
   issues: AnalysisIssue[];
 }
 
-const ANALYSIS_PROMPT = `Analysiere den folgenden Website-Content auf Textqualitätsprobleme.
+// Default prompt as fallback
+const DEFAULT_ANALYSIS_PROMPT = `Analysiere den folgenden Website-Content auf Textqualitätsprobleme.
 
 Titel: {title}
 Content:
@@ -41,6 +45,25 @@ Antworte NUR mit einem gültigen JSON-Array im folgenden Format (kein zusätzlic
 Berechne zusätzlich einen Quality Score (0-100) basierend auf der Anzahl und Schwere der gefundenen Probleme.`;
 
 /**
+ * Get the analysis prompt from DB, with fallback to default
+ */
+export async function getAnalysisPrompt(): Promise<string> {
+  try {
+    const db = await getDatabase();
+    const result = await db
+      .select()
+      .from(systemSettings)
+      .where(eq(systemSettings.key, 'analysis_prompt'))
+      .limit(1);
+
+    return result.length > 0 ? result[0].value : DEFAULT_ANALYSIS_PROMPT;
+  } catch (error) {
+    console.warn('Failed to load prompt from DB, using default:', error);
+    return DEFAULT_ANALYSIS_PROMPT;
+  }
+}
+
+/**
  * Analyze content using AI (OpenAI or Claude)
  */
 export async function analyzeContent(
@@ -48,7 +71,8 @@ export async function analyzeContent(
   content: string
 ): Promise<AnalysisResult> {
   const provider = getEnv('AI_PROVIDER', 'openai');
-  const prompt = ANALYSIS_PROMPT.replace('{title}', title).replace('{content}', content);
+  const promptTemplate = await getAnalysisPrompt();
+  const prompt = promptTemplate.replace('{title}', title).replace('{content}', content);
 
   try {
     let issues: AnalysisIssue[] = [];

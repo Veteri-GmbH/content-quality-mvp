@@ -26,7 +26,7 @@ export function Navbar({ onSignInClick }: NavbarProps = {}) {
         <SidebarTrigger className="size-8">
           <Menu className="w-5 h-5" />
         </SidebarTrigger>
-        <span className="font-semibold ml-3">Content Quality Auditor MVP v0.1</span>
+        <span className="font-semibold ml-3">Content Quality Auditor MVP v1.0</span>
       </div>
       <div className="flex items-center gap-3 ml-auto">
         {user && !isAnonymous && (
